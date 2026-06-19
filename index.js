@@ -21,6 +21,7 @@ const userSchema = new mongoose.Schema({
   prime_coins:  { type: Number, default: 0 },
   rank:         { type: String, default: 'Rookie' },
   guild:        { type: String, default: null },
+  last_claim:   { type: Date, default: null },
   created_at:   { type: Date, default: Date.now },
   last_active:  { type: Date, default: Date.now }
 });
@@ -67,6 +68,10 @@ function coinsForPP(amount) {
   return amount > 0 ? Math.floor(amount / 10) : 0;
 }
 
+// Daily claim amount — change this number to adjust how much PP players get per claim
+const DAILY_CLAIM_AMOUNT = 50;
+const CLAIM_COOLDOWN_MS  = 24 * 60 * 60 * 1000; // 24 hours
+
 // ─── Auth middleware ──────────────────────────────────────────────────────────
 
 app.use((req, res, next) => {
@@ -95,20 +100,14 @@ app.get('/users', async (req, res) => {
   }
 });
 
-// GET /users/:phone/ensure
-app.get('/users/:phone/ensure', async (req, res) => {
+// GET /users/:phone — single user profile
+app.get('/users/:phone', async (req, res) => {
   try {
-    // Strip spaces from the incoming path parameter
-    const phone = req.params.phone.replace(/\s+/g, '');
-    
-    let user = await User.findOne({ phone });
-    if (!user) {
-      user = new User({ phone, display_name: req.query.name || null });
-      await user.save();
-    }
+    const user = await User.findOne({ phone: req.params.phone });
+    if (!user) return res.status(404).json({ error: 'User not found' });
     res.json(user);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch or create user' });
+    res.status(500).json({ error: 'Failed to fetch user' });
   }
 });
 
@@ -117,9 +116,6 @@ app.get('/users/:phone/ensure', async (req, res) => {
 app.get('/users/:phone/ensure', async (req, res) => {
   try {
     const phone = req.params.phone;
-    // Atomic upsert — avoids a race condition where two near-simultaneous
-    // requests for the same new phone both try to create a user and collide
-    // on the unique index.
     const user = await User.findOneAndUpdate(
       { phone },
       { $setOnInsert: { phone, display_name: req.query.name || null } },
@@ -127,7 +123,82 @@ app.get('/users/:phone/ensure', async (req, res) => {
     );
     res.json(user);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch or create user' });
+    console.error('[ENSURE ERROR]', err);
+    res.status(500).json({ error: 'Failed to fetch or create user', detail: err.message });
+  }
+});
+
+// GET /users/:phone/claim/status — check claim eligibility without granting anything
+app.get('/users/:phone/claim/status', async (req, res) => {
+  try {
+    const user = await User.findOne({ phone: req.params.phone });
+    if (!user || !user.last_claim) {
+      return res.json({ canClaim: true, msRemaining: 0 });
+    }
+    const elapsed = Date.now() - new Date(user.last_claim).getTime();
+    if (elapsed >= CLAIM_COOLDOWN_MS) {
+      return res.json({ canClaim: true, msRemaining: 0 });
+    }
+    res.json({ canClaim: false, msRemaining: CLAIM_COOLDOWN_MS - elapsed });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to check claim status' });
+  }
+});
+
+// POST /users/:phone/claim — claim daily Prime Points (auto-creates user if needed)
+app.post('/users/:phone/claim', async (req, res) => {
+  try {
+    const phone = req.params.phone;
+    const name  = req.body?.name || '';
+
+    // Make sure the user exists (same atomic upsert pattern as /ensure)
+    const user = await User.findOneAndUpdate(
+      { phone },
+      { $setOnInsert: { phone, display_name: name || null } },
+      { new: true, upsert: true }
+    );
+
+    const now = Date.now();
+
+    if (user.last_claim && (now - new Date(user.last_claim).getTime()) < CLAIM_COOLDOWN_MS) {
+      const msRemaining = CLAIM_COOLDOWN_MS - (now - new Date(user.last_claim).getTime());
+      return res.json({ claimed: false, msRemaining, prime_points: user.prime_points });
+    }
+
+    // Atomic claim — the filter re-checks eligibility at write time, so two
+    // rapid clicks (or two tabs) can't both succeed and double-grant PP.
+    const cutoff = new Date(now - CLAIM_COOLDOWN_MS);
+    const claimed = await User.findOneAndUpdate(
+      { phone, $or: [{ last_claim: null }, { last_claim: { $lte: cutoff } }] },
+      {
+        $inc: { prime_points: DAILY_CLAIM_AMOUNT },
+        $set: { last_claim: new Date(now), last_active: new Date(now) }
+      },
+      { new: true }
+    );
+
+    if (!claimed) {
+      // Lost the race — someone/something already claimed in the meantime
+      const fresh = await User.findOne({ phone });
+      const msRemaining = CLAIM_COOLDOWN_MS - (now - new Date(fresh.last_claim).getTime());
+      return res.json({ claimed: false, msRemaining, prime_points: fresh.prime_points });
+    }
+
+    claimed.rank = calculateRank(claimed.prime_points);
+    await claimed.save();
+
+    await PPHistory.create({
+      user_id:       claimed._id,
+      amount:        DAILY_CLAIM_AMOUNT,
+      reason:        'Daily claim',
+      balance_after: claimed.prime_points,
+      granted_by:    'system'
+    });
+
+    res.json({ claimed: true, amount: DAILY_CLAIM_AMOUNT, prime_points: claimed.prime_points, user: claimed });
+  } catch (err) {
+    console.error('[CLAIM ERROR]', err);
+    res.status(500).json({ error: 'Failed to process claim' });
   }
 });
 
