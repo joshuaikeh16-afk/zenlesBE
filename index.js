@@ -95,14 +95,20 @@ app.get('/users', async (req, res) => {
   }
 });
 
-// GET /users/:phone — single user profile
-app.get('/users/:phone', async (req, res) => {
+// GET /users/:phone/ensure
+app.get('/users/:phone/ensure', async (req, res) => {
   try {
-    const user = await User.findOne({ phone: req.params.phone });
-    if (!user) return res.status(404).json({ error: 'User not found' });
+    // Strip spaces from the incoming path parameter
+    const phone = req.params.phone.replace(/\s+/g, '');
+    
+    let user = await User.findOne({ phone });
+    if (!user) {
+      user = new User({ phone, display_name: req.query.name || null });
+      await user.save();
+    }
     res.json(user);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch user' });
+    res.status(500).json({ error: 'Failed to fetch or create user' });
   }
 });
 
