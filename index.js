@@ -111,11 +111,14 @@ app.get('/users/:phone', async (req, res) => {
 app.get('/users/:phone/ensure', async (req, res) => {
   try {
     const phone = req.params.phone;
-    let user = await User.findOne({ phone });
-    if (!user) {
-      user = new User({ phone, display_name: req.query.name || null });
-      await user.save();
-    }
+    // Atomic upsert — avoids a race condition where two near-simultaneous
+    // requests for the same new phone both try to create a user and collide
+    // on the unique index.
+    const user = await User.findOneAndUpdate(
+      { phone },
+      { $setOnInsert: { phone, display_name: req.query.name || null } },
+      { new: true, upsert: true }
+    );
     res.json(user);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch or create user' });
