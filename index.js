@@ -9,7 +9,22 @@ app.use(express.json());
 
 // Connect to MongoDB
 mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log('Connected to MongoDB'))
+  .then(async () => {
+    console.log('Connected to MongoDB');
+    // One-time cleanup: an earlier schema version had a unique `username`
+    // field that no longer exists. The old index stuck around, and since a
+    // unique index only allows ONE document with a missing/null value, it
+    // silently blocked every new player after the very first one. Safe to
+    // run on every startup — does nothing once the index is already gone.
+    try {
+      await mongoose.connection.collection('users').dropIndex('username_1');
+      console.log('Dropped stale username_1 index');
+    } catch (err) {
+      if (err.codeName !== 'IndexNotFound') {
+        console.error('Index cleanup error:', err.message);
+      }
+    }
+  })
   .catch(err => console.error('Connection error:', err));
 
 // ─── Schemas ────────────────────────────────────────────────────────────────
