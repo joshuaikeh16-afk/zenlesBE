@@ -1,4 +1,9 @@
 {
+  "name": "anigamble-api",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
